@@ -122,25 +122,4 @@ invalid arguments, and `130` for Ctrl+C.
 - **Catalog/metadata errors:** The site may be temporarily unavailable or its API
   may have changed. Retry later; persistent changes require updating the script.
 - **Disk full or very long paths:** Free disk space or choose a shorter output
-<<<<<<< HEAD
   path, then rerun with the same output folder.
-=======
-  path, then rerun with the same output folder.
-
-## Sharing and development
-
-Share `download_juicewrldvault.py` and this README together. No `pip install` step
-or `requirements.txt` is needed because the script uses Python's standard library.
-Keep downloaded music, images, catalogs, and personal error reports out of the
-source bundle. If publishing a repository for reuse, choose a license and add
-its `LICENSE` file; this bundle does not currently include a license grant.
-
-Run the offline regression checks from the source folder:
-
-```sh
-python -B -m unittest -v test_download_juicewrldvault.py
-```
-
-Use `python3` or `py -3` as appropriate for your system. These checks do not
-contact the website or download music.
->>>>>>> origin/main
