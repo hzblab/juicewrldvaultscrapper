@@ -3,6 +3,7 @@
 import contextlib
 from email.message import Message
 import io
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -31,6 +32,9 @@ class FakeClient:
     def open(self, url, headers):
         self.headers = headers
         return self.response
+
+    def check_stopped(self):
+        pass
 
 
 class DownloaderTests(unittest.TestCase):
@@ -118,6 +122,51 @@ class DownloaderTests(unittest.TestCase):
     def test_nonfinite_cli_options_rejected_before_network(self):
         for option, value in (("--delay", "nan"), ("--timeout", "inf"), ("--timeout", "0")):
             with patch("sys.argv", ["downloader", option, value]), \
+                    contextlib.redirect_stderr(io.StringIO()), \
+                    patch.object(vault, "catalog") as catalog:
+                with self.assertRaises(SystemExit) as error:
+                    vault.main()
+                self.assertEqual(error.exception.code, 2)
+                catalog.assert_not_called()
+
+    def test_history_survives_removed_media(self):
+        path = Path(self.folder.name) / "history.json"
+        history = vault.DownloadHistory(path)
+        history.completed["audio"].add("song-1")
+        history.save()
+        restored = vault.DownloadHistory(path)
+        self.assertEqual(restored.completed["audio"], {"song-1"})
+        self.assertEqual(restored.completed["image"], set())
+
+    def test_history_scan_matches_ids_after_title_changes(self):
+        output = Path(self.folder.name)
+        (output / "songs").mkdir()
+        identifier = vault.song_identifier("song-1")
+        (output / "songs" / f"Old title [{identifier}].mp3").write_bytes(b"audio")
+        history = vault.DownloadHistory(output / "history.json")
+        found = history.scan([{"id": "song-1", "title": "New title"}], output)
+        self.assertEqual(found, {"audio": 1, "image": 0})
+        self.assertEqual(history.completed["audio"], {"song-1"})
+
+    def test_invalid_history_is_not_silently_overwritten(self):
+        path = Path(self.folder.name) / "history.json"
+        path.write_text(json.dumps({"version": 2}), encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "Cannot read download history"):
+            vault.DownloadHistory(path)
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {"version": 2})
+
+    def test_cancelled_download_makes_no_request(self):
+        client = vault.Client()
+        client.stop.set()
+        with patch.object(client, "open") as request:
+            with self.assertRaises(vault.DownloadCancelled):
+                vault.download(client, self.url, self.target, "audio")
+            request.assert_not_called()
+        self.assertFalse(self.target.exists())
+
+    def test_invalid_worker_counts_rejected_before_network(self):
+        for workers in ("0", "33"):
+            with patch("sys.argv", ["downloader", "--workers", workers]), \
                     contextlib.redirect_stderr(io.StringIO()), \
                     patch.object(vault, "catalog") as catalog:
                 with self.assertRaises(SystemExit) as error:

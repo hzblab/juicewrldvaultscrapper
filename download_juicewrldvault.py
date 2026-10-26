@@ -5,12 +5,19 @@ Examples:
     python download_juicewrldvault.py --list-only
     python download_juicewrldvault.py --output juicewrldvault --artwork
     python download_juicewrldvault.py --limit 2
+    python download_juicewrldvault.py --workers 8 --delay 0.1
+    python download_juicewrldvault.py --output juicewrldvault --sync-history
+
+Download history stays in ~/.juicewrldvault/downloaded_songs.json, independently
+of the media folder. Run --sync-history before moving existing songs away.
 
 Only public catalog/download endpoints are used. Hidden files and files requiring
 authentication are outside the scope of this script.
 """
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from email.utils import parsedate_to_datetime
 import hashlib
 import http.client
 import json
@@ -20,6 +27,7 @@ from pathlib import Path
 import re
 import sys
 import tempfile
+import threading
 import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlsplit
@@ -27,16 +35,44 @@ from urllib.request import Request, urlopen
 
 BASE = "https://juicewrldvault.com"
 MEDIA = "https://media.juicewrldvault.com"
-VERSION = "1.0.0"
+VERSION = "1.2.0"
 TRANSIENT = {408, 425, 429, 500, 502, 503, 504}
 
 
+class DownloadCancelled(Exception):
+    """Stop workers while retaining their partial files."""
+
+
 class Client:
-    def __init__(self, delay=0.5, retries=4, timeout=90):
+    def __init__(self, delay=0.1, retries=4, timeout=90):
         self.delay, self.retries, self.timeout = delay, retries, timeout
+        self.stop = threading.Event()
+        self._lock = threading.Lock()
+        self._next_request = 0.0
+        self._cooldown_until = 0.0
+
+    def check_stopped(self):
+        if self.stop.is_set():
+            raise DownloadCancelled()
+
+    def wait(self, seconds):
+        if self.stop.wait(seconds):
+            raise DownloadCancelled()
+
+    def pace(self):
+        # One shared request-start limit, independent of the worker count.
+        while True:
+            self.check_stopped()
+            with self._lock:
+                now = time.monotonic()
+                remaining = max(self._next_request, self._cooldown_until) - now
+                if remaining <= 0:
+                    self._next_request = now + self.delay
+                    return
+            self.wait(remaining)
 
     def open(self, url, headers=None, body=None):
-        time.sleep(self.delay)
+        self.pace()
         combined = {"User-Agent": f"VaultCatalogDownloader/{VERSION}",
                     "Accept-Encoding": "identity", "Referer": BASE + "/"}
         combined.update(headers or {})
@@ -48,9 +84,17 @@ class Client:
             value = error.headers.get("Retry-After", "")
             if value.isdigit():
                 wait = max(wait, int(value))
+            elif value:
+                try:
+                    wait = max(wait, parsedate_to_datetime(value).timestamp() - time.time())
+                except (ValueError, TypeError, OverflowError):
+                    pass
+            if error.code in {429, 503}:
+                with self._lock:
+                    self._cooldown_until = max(self._cooldown_until, time.monotonic() + wait)
             error.close()
         print(f"  Retrying in {wait}s: {error}", file=sys.stderr)
-        time.sleep(wait)
+        self.wait(wait)
 
     def json(self, path, body=None):
         payload = None if body is None else json.dumps(body).encode()
@@ -115,8 +159,59 @@ def save_json(path, data):
     os.replace(temporary, path)
 
 
+def song_identifier(song_id):
+    return safe_name(song_id, 35) + "-" + hashlib.sha256(song_id.encode()).hexdigest()[:8]
+
+
+class DownloadHistory:
+    """Only the main thread reads and updates this durable completion record."""
+
+    def __init__(self, path):
+        self.path = path
+        self.completed = {"audio": set(), "image": set()}
+        if path.exists():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(data, dict) or data.get("version") != 1:
+                    raise ValueError("unsupported history format")
+                for kind in self.completed:
+                    ids = data[kind]
+                    if not isinstance(ids, list) or any(not isinstance(item, str) for item in ids):
+                        raise ValueError("invalid song IDs")
+                    self.completed[kind] = set(ids)
+            except (ValueError, KeyError, TypeError) as error:
+                raise RuntimeError(f"Cannot read download history '{path}': {error}. "
+                                   "Restore a valid copy before continuing.") from error
+
+    def save(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        save_json(self.path, {"version": 1,
+                             **{kind: sorted(ids) for kind, ids in self.completed.items()}})
+
+    def scan(self, songs, output):
+        # Match stable suffixes even if the catalog's title/author has changed.
+        identifiers = {song_identifier(str(song["id"])) + "]": str(song["id"])
+                       for song in songs}
+        found = {"audio": 0, "image": 0}
+        for kind, directory, extensions in (
+                ("audio", "songs", {".mp3"}),
+                ("image", "artwork", {".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif", ".img"})):
+            folder = output / directory
+            if not folder.exists():
+                continue
+            for path in folder.iterdir():
+                if path.suffix.lower() not in extensions or not path.is_file() or path.stat().st_size == 0:
+                    continue
+                song_id = identifiers.get(path.stem.rpartition(" [")[2])
+                if song_id is not None:
+                    self.completed[kind].add(song_id)
+                    found[kind] += 1
+        return found
+
+
 def download(client, url, destination, kind):
     """Resume partial files with Range and If-Range; publish only complete files."""
+    client.check_stopped()
     if destination.is_file() and destination.stat().st_size > 0:
         return "skipped"
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -161,6 +256,7 @@ def download(client, url, destination, kind):
                     save_json(state_path, {"url": url, "validator": validator})
                     while chunk := response.read(1024 * 1024):
                         output.write(chunk)
+                        client.check_stopped()
                 size = partial.stat().st_size
                 if not size or total is not None and size != total:
                     raise ConnectionError(f"Incomplete file: {size} of {total} bytes")
@@ -192,17 +288,28 @@ def main():
                         help="Download folder (default: ~/Downloads/juicewrldvault)")
     parser.add_argument("--artwork", action="store_true", help="Also download each track's cover image")
     parser.add_argument("--list-only", action="store_true", help="Save catalog.json without downloading media")
+    parser.add_argument("--history", type=Path,
+                        default=Path.home() / ".juicewrldvault" / "downloaded_songs.json",
+                        help="Persistent history file (default: ~/.juicewrldvault/downloaded_songs.json)")
+    parser.add_argument("--sync-history", action="store_true",
+                        help="Record existing files using local catalog.json, then exit without network access")
     parser.add_argument("--limit", type=int, help="Download only the first N tracks (for a trial run)")
-    parser.add_argument("--delay", type=float, default=0.5, help="Seconds between requests (default: 0.5)")
+    parser.add_argument("--workers", type=int, default=6,
+                        help="Simultaneous file downloads, 1-32 (default: 6)")
+    parser.add_argument("--delay", type=float, default=0.1,
+                        help="Minimum seconds between request starts across all workers (default: 0.1)")
     parser.add_argument("--retries", type=int, default=4)
     parser.add_argument("--timeout", type=float, default=90,
                         help="Per-request socket timeout in seconds (default: 90)")
     args = parser.parse_args()
+    if args.list_only and args.sync_history:
+        parser.error("--list-only and --sync-history cannot be combined")
     if (not math.isfinite(args.delay) or args.delay < 0 or args.retries < 0
             or not math.isfinite(args.timeout) or args.timeout <= 0
-            or args.limit is not None and args.limit < 1):
+            or args.limit is not None and args.limit < 1
+            or not 1 <= args.workers <= 32):
         parser.error("delay must be finite and nonnegative; retries must be nonnegative; "
-                     "timeout must be finite and positive; limit must be positive")
+                     "timeout must be finite and positive; limit must be positive; workers must be 1-32")
     args.output = args.output.expanduser().resolve()
     try:
         args.output.mkdir(parents=True, exist_ok=True)
@@ -216,18 +323,48 @@ def main():
             f"System reported: {error}"
         ) from error
     print(f"Download folder: {args.output}", flush=True)
+    args.history = args.history.expanduser().resolve()
+    # A history file must never replace catalog, failure reports or media files.
+    if (args.history in {args.output / "catalog.json", args.output / "failures.json"}
+            or args.output / "songs" in args.history.parents
+            or args.output / "artwork" in args.history.parents):
+        parser.error("Choose a --history path separate from catalog.json, failures.json and media folders")
+    if args.sync_history:
+        try:
+            songs = json.loads((args.output / "catalog.json").read_text(encoding="utf-8"))
+        except FileNotFoundError as error:
+            raise RuntimeError("No catalog.json in the output folder. Run with --list-only first, "
+                               "then rerun --sync-history.") from error
+        if (not isinstance(songs, list) or not songs
+                or any(not isinstance(song, dict) or song.get("id") is None for song in songs)):
+            raise RuntimeError("Invalid local catalog.json; refresh it with --list-only.")
+        history = DownloadHistory(args.history)
+        found = history.scan(songs, args.output)
+        if not found["audio"]:
+            raise RuntimeError("No completed songs matched the local catalog. Check --output and keep "
+                               "the original ID suffixes in the filenames until history is recorded.")
+        history.save()
+        print(f"Recorded {found['audio']} existing songs and {found['image']} artwork files.")
+        print(f"History saved to: {args.history}")
+        print("You can now move or rename these files. Keep the history file on this computer.")
+        return 0
     client = Client(args.delay, args.retries, args.timeout)
+    history = None if args.list_only else DownloadHistory(args.history)
     songs = catalog(client)
     save_json(args.output / "catalog.json", songs)
     print(f"Found {len(songs)} public tracks. Catalog saved to {args.output / 'catalog.json'}")
     if args.list_only:
         return 0
+    history.scan(songs, args.output)
+    history.save()
+    print(f"History: {args.history} ({len(history.completed['audio'])} songs recorded)", flush=True)
     selected = songs if args.limit is None else songs[:args.limit]
     failures, counts = [], {"downloaded": 0, "skipped": 0}
-    for number, song in enumerate(selected, 1):
+    all_jobs = []
+    for song in selected:
         song_id = str(song["id"])
         # Stable ID suffix prevents collisions between versions with identical titles.
-        identifier = safe_name(song_id, 35) + "-" + hashlib.sha256(song_id.encode()).hexdigest()[:8]
+        identifier = song_identifier(song_id)
         stem = safe_name(f"{song.get('title', 'Untitled')} - {song.get('author', 'Unknown')}")
         stem += f" [{identifier}]"
         jobs = [(BASE + "/api/download-song?" + urlencode({"id": song_id}),
@@ -246,15 +383,40 @@ def main():
                 extension = ".img"
             jobs.append((image_url, args.output / "artwork" / (stem + extension), "image"))
         for url, destination, kind in jobs:
+            if song_id in history.completed[kind]:
+                counts["skipped"] += 1
+            else:
+                all_jobs.append((song_id, url, destination, kind))
+    print(f"Skipping {counts['skipped']} files already recorded in history.", flush=True)
+    print(f"Downloading {len(all_jobs)} files with {args.workers} workers "
+          f"(request spacing: {args.delay}s).", flush=True)
+    started = time.monotonic()
+    executor = ThreadPoolExecutor(max_workers=args.workers)
+    try:
+        pending = {executor.submit(download, client, url, destination, kind):
+                   (song_id, url, destination, kind)
+                   for song_id, url, destination, kind in all_jobs}
+        for number, future in enumerate(as_completed(pending), 1):
+            song_id, url, destination, kind = pending[future]
             try:
-                status = download(client, url, destination, kind)
+                status = future.result()
                 counts[status] += 1
-                print(f"[{number}/{len(selected)}] {status}: {destination.name}", flush=True)
+                print(f"[{number}/{len(all_jobs)}] {status}: {destination.name}", flush=True)
             except (OSError, ValueError, RuntimeError, http.client.HTTPException) as error:
                 print(f"FAILED: {destination.name}: {error}", file=sys.stderr)
                 failures.append({"id": song_id, "url": url, "file": str(destination), "error": str(error)})
+            else:
+                history.completed[kind].add(song_id)
+                history.save()
+    finally:
+        # Cancel queued work on Ctrl+C; active workers stop between reads or after
+        # their socket timeout. Their .part files can be resumed on the next run.
+        client.stop.set()
+        executor.shutdown(wait=True, cancel_futures=True)
     save_json(args.output / "failures.json", failures)
-    print(f"Done: {counts['downloaded']} downloaded, {counts['skipped']} skipped, {len(failures)} failed.")
+    elapsed = time.monotonic() - started
+    print(f"Done in {elapsed / 60:.1f} min: {counts['downloaded']} downloaded, "
+          f"{counts['skipped']} skipped, {len(failures)} failed.")
     return 1 if failures else 0
 
 

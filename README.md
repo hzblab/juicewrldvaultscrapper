@@ -72,8 +72,11 @@ are restricted by the operating system.
 | `--output PATH` | Sets the output folder | `~/Downloads/juicewrldvault` |
 | `--artwork` | Downloads each track's cover as a separate image | Off |
 | `--list-only` | Saves the full catalog without downloading music or images | Off |
+| `--history PATH` | Sets the persistent download history file | `~/.juicewrldvault/downloaded_songs.json` |
+| `--sync-history` | Records existing files from the local catalog and exits without network access | Off |
 | `--limit N` | Processes only the first N catalog tracks | All tracks |
-| `--delay SECONDS` | Pauses before each HTTP request | `0.5` |
+| `--workers N` | Sets simultaneous file downloads (1–32) | `6` |
+| `--delay SECONDS` | Sets minimum request-start spacing across all workers | `0.1` |
 | `--retries N` | Sets retry attempts after the initial request | `4` |
 | `--timeout SECONDS` | Sets the socket timeout for each request | `90` |
 | `--version` | Prints the script version and exits | |
@@ -81,7 +84,13 @@ are restricted by the operating system.
 
 `--limit` still fetches and saves the complete catalog before downloading the
 selected tracks. Artwork is saved separately and is not embedded into MP3 tags.
-Requests run sequentially. Retry delays are additional to `--delay`.
+Files download concurrently. All workers share request pacing and a cooldown
+after HTTP 429/503 responses; retry waits also respect `Retry-After` headers.
+Use `--workers 1` for sequential downloads, or adjust concurrency with:
+
+```powershell
+py -3 .\download_juicewrldvault.py --workers 8 --delay 0.1
+```
 
 ## Output and resuming
 
@@ -94,15 +103,32 @@ juicewrldvault/
 ```
 
 Press **Ctrl+C** to stop. Run the same command with the same output folder to
-continue. Completed, nonempty files are skipped. Interrupted files remain as
+continue. Completed IDs are saved to a persistent history file outside the media
+folder, so moving or renaming downloaded music does not cause it to download
+again. Existing nonempty files with their original ID suffixes are also recorded
+automatically. Interrupted files remain as
 `.part` files with `.part.json` metadata. They resume when the server provides
 the required range and validation headers; otherwise they restart safely.
 Keep these files if you plan to resume.
 
 Existing files are checked for presence and nonzero size, not checked against a
 remote checksum. To replace a corrupted completed file or fetch an updated
-version with the same filename, remove that file and rerun. Avoid running two
-copies of the script against the same output folder at the same time.
+version, remove that file and its ID from the relevant `audio` or `image` list in
+the history JSON, then rerun. Back up the history before editing it. Avoid running
+two copies against the same output folder or history file at the same time.
+
+Before moving music downloaded by an older version, record the existing files
+using the saved `catalog.json` and the original filenames:
+
+```powershell
+py -3 .\download_juicewrldvault.py --output "D:\Music\Juice Vault" --sync-history
+```
+
+This operation is offline and requires at least one matching completed song.
+Keep the history file after moving the music. Use the same `--history PATH` for
+future runs if you choose a custom location. `--list-only` and `--sync-history`
+cannot be combined, and the history path must be separate from catalog,
+failure-report, and media paths.
 
 `catalog.json` is refreshed each run. `failures.json` is written when a download
 run finishes; it may be absent or reflect an earlier run after an interruption
