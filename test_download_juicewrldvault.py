@@ -3,12 +3,16 @@
 import contextlib
 from email.message import Message
 import io
+import json
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
 
 import download_juicewrldvault as vault
+
+FRAME = b"\xff\xfb\x90\x00" + bytes(413)
+AUDIO = FRAME * 2
 
 
 class Response(io.BytesIO):
@@ -32,6 +36,9 @@ class FakeClient:
         self.headers = headers
         return self.response
 
+    def check_stopped(self):
+        pass
+
 
 class DownloaderTests(unittest.TestCase):
     def setUp(self):
@@ -41,37 +48,37 @@ class DownloaderTests(unittest.TestCase):
         self.url = "https://example.invalid/song"
 
     def test_complete_download_then_skip(self):
-        client = FakeClient(Response(b"abcdef", Content_Length="6"))
+        client = FakeClient(Response(AUDIO, Content_Length=str(len(AUDIO))))
         self.assertEqual(vault.download(client, self.url, self.target, "audio"), "downloaded")
-        self.assertEqual(self.target.read_bytes(), b"abcdef")
+        self.assertEqual(self.target.read_bytes(), AUDIO)
         self.assertEqual(vault.download(client, self.url, self.target, "audio"), "skipped")
 
     def seed_partial(self, state=None):
         part = self.target.with_name("song.mp3.part")
-        part.write_bytes(b"abc")
+        part.write_bytes(FRAME)
         vault.save_json(part.with_name(part.name + ".json"), state if state is not None else {
             "url": self.url, "validator": '"v1"'
         })
 
     def test_range_resume(self):
         self.seed_partial()
-        client = FakeClient(Response(b"def", 206, Content_Range="bytes 3-5/6"))
+        client = FakeClient(Response(FRAME, 206, Content_Range=f"bytes 417-833/834"))
         vault.download(client, self.url, self.target, "audio")
-        self.assertEqual(client.headers, {"Range": "bytes=3-", "If-Range": '"v1"'})
-        self.assertEqual(self.target.read_bytes(), b"abcdef")
+        self.assertEqual(client.headers, {"Range": "bytes=417-", "If-Range": '"v1"'})
+        self.assertEqual(self.target.read_bytes(), AUDIO)
 
     def test_server_ignores_range_restarts_file(self):
         self.seed_partial()
-        client = FakeClient(Response(b"new", Content_Length="3"))
+        client = FakeClient(Response(AUDIO, Content_Length=str(len(AUDIO))))
         vault.download(client, self.url, self.target, "audio")
-        self.assertEqual(self.target.read_bytes(), b"new")
+        self.assertEqual(self.target.read_bytes(), AUDIO)
 
     def test_invalid_resume_state_restarts_file(self):
         self.seed_partial(["invalid", "state"])
-        client = FakeClient(Response(b"new", Content_Length="3"))
+        client = FakeClient(Response(AUDIO, Content_Length=str(len(AUDIO))))
         vault.download(client, self.url, self.target, "audio")
         self.assertEqual(client.headers, {})
-        self.assertEqual(self.target.read_bytes(), b"new")
+        self.assertEqual(self.target.read_bytes(), AUDIO)
 
     def test_incomplete_download_is_not_published(self):
         client = FakeClient(Response(b"abc", Content_Length="6"))
@@ -118,6 +125,51 @@ class DownloaderTests(unittest.TestCase):
     def test_nonfinite_cli_options_rejected_before_network(self):
         for option, value in (("--delay", "nan"), ("--timeout", "inf"), ("--timeout", "0")):
             with patch("sys.argv", ["downloader", option, value]), \
+                    contextlib.redirect_stderr(io.StringIO()), \
+                    patch.object(vault, "catalog") as catalog:
+                with self.assertRaises(SystemExit) as error:
+                    vault.main()
+                self.assertEqual(error.exception.code, 2)
+                catalog.assert_not_called()
+
+    def test_history_survives_removed_media(self):
+        path = Path(self.folder.name) / "history.json"
+        history = vault.DownloadHistory(path)
+        history.completed["audio"].add("song-1")
+        history.save()
+        restored = vault.DownloadHistory(path)
+        self.assertEqual(restored.completed["audio"], {"song-1"})
+        self.assertEqual(restored.completed["image"], set())
+
+    def test_history_scan_matches_ids_after_title_changes(self):
+        output = Path(self.folder.name)
+        (output / "songs").mkdir()
+        identifier = vault.song_identifier("song-1")
+        (output / "songs" / f"Old title [{identifier}].mp3").write_bytes(AUDIO)
+        history = vault.DownloadHistory(output / "history.json")
+        found = history.scan([{"id": "song-1", "title": "New title"}], output)
+        self.assertEqual(found, {"audio": 1, "image": 0})
+        self.assertEqual(history.completed["audio"], {"song-1"})
+
+    def test_invalid_history_is_not_silently_overwritten(self):
+        path = Path(self.folder.name) / "history.json"
+        path.write_text(json.dumps({"version": 2}), encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "Cannot read download history"):
+            vault.DownloadHistory(path)
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {"version": 2})
+
+    def test_cancelled_download_makes_no_request(self):
+        client = vault.Client()
+        client.stop.set()
+        with patch.object(client, "open") as request:
+            with self.assertRaises(vault.DownloadCancelled):
+                vault.download(client, self.url, self.target, "audio")
+            request.assert_not_called()
+        self.assertFalse(self.target.exists())
+
+    def test_invalid_worker_counts_rejected_before_network(self):
+        for workers in ("0", "33"):
+            with patch("sys.argv", ["downloader", "--workers", workers]), \
                     contextlib.redirect_stderr(io.StringIO()), \
                     patch.object(vault, "catalog") as catalog:
                 with self.assertRaises(SystemExit) as error:
